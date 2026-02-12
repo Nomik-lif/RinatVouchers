@@ -7,11 +7,11 @@ function handleFormSubmit(e) {
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
   const rowData = sheet.getRange(row, 1, 1, headers.length).getValues()[0];
   //const editUrl = e.response.getEditResponseUrl(); // כתובת לעדכון הטופס
-  const data = {};
-
-
   
+  const data = {};
   headers.forEach((h, i) => data[h] = rowData[i]); // טעינת המידע
+
+  const mode = data.Mode;
 
   const expiryFormatted = data.expiry  // עיצוב התוקף בפורמט הנכון
   ? Utilities.formatDate(
@@ -21,9 +21,70 @@ function handleFormSubmit(e) {
     )
   : '';
 
-  if (data.status === 'Created') return; 
+
+  const statusCol = headers.indexOf('status') + 1;
+  const pdfCol = headers.indexOf('pdf_url') + 1;
+  const imageCol = headers.indexOf('image_url') + 1;
+  const createdCol = headers.indexOf('created_at') + 1;
+
+  const folderIdCol = headers.indexOf('folder_id') + 1;
+  const pdfIdCol = headers.indexOf('pdf_file_id') + 1;
+  const imageIdCol = headers.indexOf('image_file_id') + 1;
+
+  
+  if (statusCol < 1 || pdfCol < 1 || imageCol < 1 || createdCol < 1) {
+  throw new Error('Ooops - Missing required columns in spreadsheet');
+}
+
+  let targetRow = row;
 
 
+
+  // =============================
+  // מצב: תיקון שובר אחרון
+  // =============================
+  if (mode && mode.includes('לא')) {
+
+    const lastRow = sheet.getLastRow();
+
+    for (let i = lastRow; i > 1; i--) {
+      const statusValue = sheet.getRange(i, statusCol).getValue();
+      if (statusValue === 'Created') {
+        targetRow = i;
+        break;
+      }
+    }
+
+    if (!targetRow) return;
+
+    // מעדכנים רק שדות תוכן ולא מזהים פנימיים
+    const fieldsToUpdate = ['recipient', 'service', 'purchaser', 'expiry'];
+
+    fieldsToUpdate.forEach(field => {
+      const col = headers.indexOf(field) + 1;
+      if (col > 0) {
+        sheet.getRange(targetRow, col).setValue(data[field]);
+    }
+    });
+
+    // מסמנים את השורה החדשה כבקשת תיקון בלבד
+    sheet.getRange(row, statusCol).setValue('Updated !');
+
+
+  } else {
+
+    // =============================
+    // מצב: שובר חדש
+    // =============================
+    if (data.status === 'Created') return;
+
+  }
+
+
+
+  // =============================
+  // יצירת השובר (חדש או דריסה)
+  // =============================
   // ===== 1. שכפול תבנית Slides בשביל שובר חדש =====
   const copy = DriveApp.getFileById(SLIDES_TEMPLATE_ID)
     .makeCopy(`temp_${Date.now()}`, DriveApp.getFolderById(OUTPUT_FOLDER_ID));
@@ -49,21 +110,53 @@ function handleFormSubmit(e) {
   // ===== 3. שם הקובץ ותיקייה ייעודית =====
   const createdDate = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
   const finalName = `${createdDate}__שובר מתנה__${data.voucher_id}`;
+  
   const purchaserSafe = data.purchaser || 'unknown';
   const recipientSafe = data.recipient || 'unknown';
-  const folderName = `${createdDate}__${data.voucher_id}__${purchaserSafe}__${recipientSafe}`;
-
-  // יצירת תת-תיקייה בתוך התיקייה הראשית
-  const outputFolder = DriveApp.getFolderById(OUTPUT_FOLDER_ID).createFolder(folderName);
+  const folderNamePart = `__${data.voucher_id}__${purchaserSafe}__${recipientSafe}`;
+  
 
 
+  const parentFolder = DriveApp.getFolderById(OUTPUT_FOLDER_ID);
+let outputFolder;
 
-  // ===== 4. יצירת PDF =====
+let existingFolderId = sheet.getRange(targetRow, folderIdCol).getValue();
+
+if (mode && mode.includes('לא') && existingFolderId) {
+
+  // שימוש בתיקייה קיימת לפי ID
+  outputFolder = DriveApp.getFolderById(existingFolderId);
+
+  // מחיקת קבצים קיימים לפי ID
+  const existingPdfId = sheet.getRange(targetRow, pdfIdCol).getValue();
+  const existingImageId = sheet.getRange(targetRow, imageIdCol).getValue();
+
+  if (existingPdfId) {
+    try { DriveApp.getFileById(existingPdfId).setTrashed(true); } catch(e){}
+  }
+
+  if (existingImageId) {
+    try { DriveApp.getFileById(existingImageId).setTrashed(true); } catch(e){}
+  }
+
+} else {
+
+  // יצירת תיקייה חדשה
+  const folderName = `${createdDate}__${data.voucher_id}__${data.purchaser}__${data.recipient}`;
+  outputFolder = parentFolder.createFolder(folderName);
+
+}
+
+
+  
+  
+ // ===== 4. יצירת PDF =====
   const pdfBlob = copy.getAs(MimeType.PDF).setName(finalName + '.pdf');
   const pdfFile = outputFolder.createFile(pdfBlob);
 
 
-  // ===== 5. יצירת PNG =====
+
+// ===== 5. יצירת PNG =====
   const exportUrl = `https://docs.google.com/presentation/d/${copy.getId()}/export/png?pageid=${slideId}`;
   const token = ScriptApp.getOAuthToken();
   const response = UrlFetchApp.fetch(exportUrl, {
@@ -73,38 +166,45 @@ function handleFormSubmit(e) {
   const imageFile = outputFolder.createFile(imageBlob);
 
 
+  // שמירת מזהים פנימיים בגיליון
+  sheet.getRange(targetRow, folderIdCol).setValue(outputFolder.getId());
+  sheet.getRange(targetRow, pdfIdCol).setValue(pdfFile.getId());
+  sheet.getRange(targetRow, imageIdCol).setValue(imageFile.getId());
 
-  // ===== 6.  עדכון הגיליון אקסל - גוגל שיט =====
-  const statusCol = headers.indexOf('status') + 1;
-  const pdfCol = headers.indexOf('pdf_url') + 1;
-  const imageCol = headers.indexOf('image_url') + 1;
-  const createdCol = headers.indexOf('created_at') + 1;
-  const editCol = headers.indexOf('edit_response_url') + 1;
 
-  if (statusCol) sheet.getRange(row, statusCol).setValue('Created');
-  if (pdfCol) sheet.getRange(row, pdfCol).setValue(pdfFile.getUrl());
-  if (imageCol) sheet.getRange(row, imageCol).setValue(imageFile.getUrl());
-  if (createdCol) sheet.getRange(row, createdCol).setValue(new Date());
-  //if (editCol) sheet.getRange(row, editCol).setValue(editUrl);
+
+
+  // עדכון שורה רלוונטית
+  sheet.getRange(targetRow, statusCol).setValue('Created');
+  sheet.getRange(targetRow, pdfCol).setValue(pdfFile.getUrl());
+  sheet.getRange(targetRow, imageCol).setValue(imageFile.getUrl());
+  sheet.getRange(targetRow, createdCol).setValue(new Date());
+
+
+
 
 
 
   // ===== 7. שליחת מייל =====
+    let ModeText = '';
+    if (mode && mode.includes('לא')) {ModeText = 'מתוקן'};
     const fixedEmail = 'nomik.lif@gmail.com'; // כתובת קבועה
     const fixedCC = 'rinatkom+voucher@gmail.com'; // כתובת קבועה
-    const subject = `שובר מתנה ${data.voucher_id} מ${data.From} ל${data.To}`;
-    const body = `היי,\n\nמצורף השובר של ${data.From} עבור ${data.To} 🎁
-    \n\nהקדשה:\n${data.recipient}
-    \n\nשובר:\n${data.service}
-    \n\nברכה:\n${data.purchaser}
-    \n\nתוקף: ${expiryFormatted}
-    \n\nתודה רבה,\nרינת ליפשיץ`;
+    const subject = `שובר מתנה ${ModeText} ${data.voucher_id}  מ${data.From} ל${data.To}`;
+    const body = `
+    מצורף השובר שנרכש ע"י  <b>${data.From}</b>  עבור  <b>${data.To}</b> 🎁
+    <br><br><b>הקדשה:</b><br>${data.recipient}
+    <br><br><b>קיבלת שובר מתנה:</b><br>${data.service}
+    <br><br><b>ברכה:</b><br>${data.purchaser}
+    <br><br><b>תוקף:</b> ${expiryFormatted}
+    <br><b>הערה:</b> ${data.Note}
+    <br><br>תודה רבה,<br>השובר-בוט שלך`;
 
     MailApp.sendEmail({
       to: fixedEmail,
       cc: fixedCC,
       subject: subject,
-      body: body,
+      htmlBody: body,
       attachments: [pdfFile.getBlob(), imageFile.getBlob()]
     });
 
